@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 按机构独立爬取与归档的维普 PDF 下载器
-win + r chrome.exe --remote-debugging-port=9223 --user-data-dir="C:\chrome_debug_profile"
+win + r chrome.exe --remote-debugging-port=9223 --user-data-dir="C:\chrome_debug_profile_231"
 基于原版增强功能：
 1. 支持按机构独立爬取与归档
 2. 动态参数接收与交互回退
@@ -11,10 +11,13 @@ win + r chrome.exe --remote-debugging-port=9223 --user-data-dir="C:\chrome_debug
 
 import argparse
 import asyncio
+import ctypes
+import os
 import random
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -30,12 +33,14 @@ BASE_SAVE_DIR        = Path("./vip_pdfs")  # 基础保存目录
 DB_PATH              = Path("./data/membrane_papers.db")
 EXCEL_PATH           = Path("./质检省一级单位统计.xlsx")  # Excel 数据源
 DOWNLOAD_TIMEOUT_MS  = 30_000      # 下载超时提高到 30 秒
-PAGE_LOAD_TIMEOUT_MS = 20_000      # 页面加载超时提高到 20 秒
-ELEM_WAIT_TIMEOUT_MS = 15_000      # 元素等待超时提高到 15 秒
-SLEEP_BETWEEN        = (3, 8)      # 爬取间隔提高到 3-8 秒
-MAX_CARD_RETRIES     = 3           # 最大重试次数提高到 3 次
+PAGE_LOAD_TIMEOUT_MS = 10_000      # 页面加载超时提高到 10 秒
+ELEM_WAIT_TIMEOUT_MS = 8_000      # 元素等待超时提高到 8 秒
+SLEEP_BETWEEN        = (2.5, 4.5)  # 正常阶段下载间隔
+FAST_SLEEP           = (1.5, 3.0)  # 快速阶段下载间隔
+FAST_PHASE_PAGES     = 2           # 前N页快速爬取，之后降速
+MAX_CARD_RETRIES     = 3           # 最大重试次数
 
-# CSS 选择器 - 与原版保持一致
+# CSS 选择器
 CARD_SELECTOR        = "#articlelist dl:visible"
 AUTHOR_SELECTOR      = "dd.author"
 ABSTRACT_SELECTOR    = "dd.abstract, dd.summary, dd.remark"
@@ -137,7 +142,7 @@ def get_target_institution():
         dest="TARGET_INSTITUTION",
         help="指定目标机构名称，例如：清华大学、北京大学"
     )
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     if args.TARGET_INSTITUTION:
         return args.TARGET_INSTITUTION
@@ -164,19 +169,56 @@ def get_target_institution():
     return selected_institution
 
 
+# ── 跨进程 PV 信号量（Windows 命名互斥体） ─────────────
+#
+# 原理：多脚本并发写同一 SQLite 时，通过 OS 级命名互斥体串行化写操作
+#   P 操作: __enter__ → WaitForSingleObject（阻塞等待，OS 调度，不轮询）
+#   V 操作: __exit__  → ReleaseMutex（立即释放）
+# 读操作(is_duplicate)无需互斥体，WAL 允许并发读
+# 进程崩溃时 OS 自动回收互斥体，不会死锁
+# ────────────────────────────────────────────────────────
+
+_kernel32 = ctypes.windll.kernel32
+_MUTEX_NAME = "Global\\VIPCrawlerDBMutex"
+
+
+class DBWriteGuard:
+    """跨进程 PV 信号量：with db_guard → P 获取写锁 → V 释放"""
+
+    def __init__(self, timeout_ms=10000):
+        self._handle = _kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        self._timeout = timeout_ms
+
+    def __enter__(self):
+        # P 操作
+        result = _kernel32.WaitForSingleObject(self._handle, self._timeout)
+        if result not in (0, 0x80):  # WAIT_OBJECT_0 | WAIT_ABANDONED
+            raise TimeoutError(f"数据库写锁等待超时 ({self._timeout}ms)")
+        return self
+
+    def __exit__(self, *args):
+        # V 操作
+        _kernel32.ReleaseMutex(self._handle)
+
+    def __del__(self):
+        if self._handle:
+            _kernel32.CloseHandle(self._handle)
+
+
+_db_guard = DBWriteGuard()
+
+
 # ── 数据库相关函数 ─────────────────────────────────
 
 def init_db(db_path):
     """初始化数据库，确保兼容性"""
-    # 创建数据目录
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 初始化连接
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
 
-    # 检查表是否存在，不存在则创建
     conn.execute("""
                  CREATE TABLE IF NOT EXISTS papers (
                                                        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,25 +235,21 @@ def init_db(db_path):
                                                        ai_industry_category TEXT,
                                                        ai_product_category  TEXT,
                                                        ai_quality_issue     TEXT,
-                                                       institution          TEXT,                  -- 新增：机构字段
+                                                       institution          TEXT,
                                                        scrape_time          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                  )
                  """)
 
-    # 检查是否需要添加 institution 字段（兼容旧表）
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(papers)")
     existing_cols = {row[1] for row in cursor.fetchall()}
 
-    # 添加缺失的字段（兼容旧数据库）
     if "institution" not in existing_cols:
         print("[INFO] 添加 institution 字段以兼容旧数据库...")
         cursor.execute("ALTER TABLE papers ADD COLUMN institution TEXT")
 
-    # 为 institution 字段创建索引（提高查询性能）
-    index_name = "idx_papers_institution"
-    cursor.execute(f"""
-        CREATE INDEX IF NOT EXISTS {index_name}
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_papers_institution
         ON papers(institution)
     """)
 
@@ -220,39 +258,48 @@ def init_db(db_path):
 
 
 def is_duplicate(conn, title, institution=None):
-    """检查是否为重复论文：基于标题去重，可选过滤机构"""
+    """检查是否为已处理的论文（纯读操作，无需互斥体，WAL 并发读）
+    ok/skip → 跳过    error/timeout/pending → 需重试"""
     if institution:
-        # 机构去重模式：同一机构内不能有重复标题
-        cursor = conn.cursor()
-        cursor.execute(
+        row = conn.execute(
             "SELECT download_status FROM papers WHERE title = ? AND institution = ?",
             (title, institution)
-        )
-        row = cursor.fetchone()
-        return row is not None and row["download_status"] == "ok"
+        ).fetchone()
     else:
-        # 兼容旧版本：全库去重
-        cursor = conn.cursor()
-        cursor.execute(
+        row = conn.execute(
             "SELECT download_status FROM papers WHERE title = ?",
             (title,)
-        )
-        row = cursor.fetchone()
-        return row is not None and row["download_status"] == "ok"
+        ).fetchone()
+    return row is not None and row["download_status"] in ("ok", "skip")
 
 
 def upsert_paper(conn, data):
-    """插入或更新论文数据"""
+    """写入论文数据：已成功的记录不被失败记录覆盖"""
     cols = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
-    updates = ", ".join(f"{k}=excluded.{k}" for k in data if k != "title")
+    safe_updates = []
+    for k in data:
+        if k == "title":
+            continue
+        if k == "download_status":
+            safe_updates.append(
+                f"{k}=IIF(papers.download_status='ok', papers.{k}, excluded.{k})"
+            )
+        elif k == "pdf_local_path":
+            safe_updates.append(
+                f"{k}=IIF(papers.download_status='ok', papers.{k}, excluded.{k})"
+            )
+        else:
+            safe_updates.append(f"{k}=excluded.{k}")
+    updates = ", ".join(safe_updates)
 
-    conn.execute(
-        f"INSERT INTO papers ({cols}) VALUES ({placeholders})"
-        f" ON CONFLICT(title) DO UPDATE SET {updates}",
-        list(data.values())
-    )
-    conn.commit()
+    with _db_guard:
+        conn.execute(
+            f"INSERT INTO papers ({cols}) VALUES ({placeholders})"
+            f" ON CONFLICT(title) DO UPDATE SET {updates}",
+            list(data.values())
+        )
+        conn.commit()
 
 
 # ── 页面状态检测（与原版保持一致） ─────────────────────────────
@@ -316,8 +363,8 @@ def sanitize_filename(name):
     return name.strip()[:200] or "未命名论文"
 
 
-async def safe_text(locator, timeout=5000, default=""):
-    """安全获取文本内容，增加超时时间"""
+async def safe_text(locator, timeout=3000, default=""):
+    """安全获取文本内容"""
     try:
         await locator.first.wait_for(state="attached", timeout=timeout)
         return (await locator.first.inner_text(timeout=timeout)).strip()
@@ -325,8 +372,8 @@ async def safe_text(locator, timeout=5000, default=""):
         return default
 
 
-async def safe_attr(locator, attr, timeout=5000, default=""):
-    """安全获取属性值，增加超时时间"""
+async def safe_attr(locator, attr, timeout=3000, default=""):
+    """安全获取属性值"""
     try:
         await locator.first.wait_for(state="attached", timeout=timeout)
         val = await locator.first.get_attribute(attr, timeout=timeout)
@@ -347,21 +394,27 @@ async def simulate_human_behavior(page, card_locator):
         target_x = box["x"] + random.uniform(12, max(20, box["width"] - 12))
         target_y = box["y"] + random.uniform(8, max(16, box["height"] - 8))
 
-        start_x = max(0, target_x + random.uniform(-200, 200))
-        start_y = max(0, target_y + random.uniform(-150, 150))
+        start_x = max(0, target_x + random.uniform(-120, 120))
+        start_y = max(0, target_y + random.uniform(-80, 80))
 
         await page.mouse.move(start_x, start_y)
-        await page.mouse.move(target_x, target_y, steps=random.randint(20, 50))
-        await page.mouse.wheel(0, random.choice([-300, 200, 400, -150, -100, 500]))
-        await asyncio.sleep(random.uniform(1.0, 2.5))  # 增加随机延迟
+        await page.mouse.move(target_x, target_y, steps=random.randint(10, 25))
+        await page.mouse.wheel(0, random.choice([-200, 150, 300, -100]))
+        await asyncio.sleep(random.uniform(0.5, 1.0))
     except Exception:
         return
 
 
 # ── 核心处理逻辑 ─────────────────────────────────
 
-async def process_page(page, save_dir, conn, page_num, institution_name):
-    """遍历当前列表页，返回统计字典"""
+async def process_page(page, save_dir, conn, page_num, institution_name, fast_mode=False):
+    """遍历当前列表页，返回统计字典
+
+    快速通道策略：
+    - 重复论文 / 无按钮 → 零延迟直接跳过，不做模拟行为
+    - 快速阶段（前N页）：跳过鼠标模拟，短间隔
+    - 正常阶段：完整模拟行为，正常间隔
+    """
     stats = {"downloaded": 0, "skipped": 0, "duplicate": 0, "timeout": 0, "error": 0}
 
     if not await check_page_alive(page):
@@ -377,7 +430,8 @@ async def process_page(page, save_dir, conn, page_num, institution_name):
     if total == 0:
         print(f"[WARN] 第 {page_num} 页：卡片数为 0，跳过。")
         return stats
-    print(f"\n[INFO] 第 {page_num} 页共找到 {total} 篇论文（机构：{institution_name}）")
+    phase_tag = "[FAST]" if fast_mode else "[NORMAL]"
+    print(f"\n[INFO] 第 {page_num} 页共找到 {total} 篇论文（机构：{institution_name}）{phase_tag}")
 
     for i in range(total):
         card = cards.nth(i)
@@ -386,44 +440,44 @@ async def process_page(page, save_dir, conn, page_num, institution_name):
             print(f"[ERR] 第 {i+1} 篇：页面中途失联，终止本页遍历。")
             break
 
-        await simulate_human_behavior(page, card)
-
+        # 轻量 DOM 就绪检查
         try:
-            scroll_timeout = random.uniform(3000, 5000)
-            await card.scroll_into_view_if_needed(timeout=scroll_timeout)
-        except Exception:
-            pass
-
-        try:
-            wait_timeout = random.uniform(4000, 6000)
-            await card.wait_for(state="attached", timeout=wait_timeout)
+            await card.wait_for(state="attached", timeout=3000)
         except PlaywrightTimeoutError:
             print(f"  [{i+1}/{total}] [WARN] 卡片 DOM 未就绪，跳过")
             stats["error"] += 1
             continue
 
-        title_raw  = await safe_text(card.locator(TITLE_SELECTOR),   default=f"第{page_num}页第{i+1}篇")
-        authors    = await safe_text(card.locator(AUTHOR_SELECTOR))
-        abstract   = await safe_text(card.locator(ABSTRACT_SELECTOR))
-        keywords   = await safe_text(card.locator(KEYWORD_SELECTOR))
-        pub_year   = await safe_text(card.locator(YEAR_SELECTOR))
-        journal    = await safe_text(card.locator(JOURNAL_SELECTOR))
-        detail_url = await safe_attr(card.locator("a"), "href")
-
+        # ① 先提取标题 → 快速去重
+        title_raw = await safe_text(
+            card.locator(TITLE_SELECTOR), timeout=2000,
+            default=f"第{page_num}页第{i+1}篇"
+        )
         title = sanitize_filename(title_raw)
         print(f"  [{i+1}/{total}] {title}")
 
-        # 使用机构去重逻辑
+        # ★ 快速通道 A：重复论文 → 零延迟跳过
         if is_duplicate(conn, title, institution_name):
             print("    [DUP]  数据库已有此篇且下载成功，跳过")
             stats["duplicate"] += 1
             continue
 
+        # ② 非重复 → 并行提取完整元数据
+        authors, abstract, keywords, pub_year, journal, detail_url = await asyncio.gather(
+            safe_text(card.locator(AUTHOR_SELECTOR)),
+            safe_text(card.locator(ABSTRACT_SELECTOR)),
+            safe_text(card.locator(KEYWORD_SELECTOR)),
+            safe_text(card.locator(YEAR_SELECTOR)),
+            safe_text(card.locator(JOURNAL_SELECTOR)),
+            safe_attr(card.locator("a"), "href"),
+        )
+
+        # ③ 快速检测下载按钮
         btn_loc   = card.locator(DOWNLOAD_BTN_SEL)
-        btn_ready = await is_element_ready(btn_loc, timeout=random.uniform(3000, 5000))
         btn_count = await btn_loc.count()
 
-        if not btn_ready and btn_count == 0:
+        # ★ 快速通道 B：无下载按钮 → 零延迟跳过
+        if btn_count == 0:
             print("    [SKIP] 无下载按钮(可能为原文传递)，极速跳过")
             upsert_paper(conn, {
                 "title": title, "authors": authors, "abstract_text": abstract,
@@ -436,6 +490,15 @@ async def process_page(page, save_dir, conn, page_num, institution_name):
             stats["skipped"] += 1
             continue
 
+        # ④ 有下载按钮 → 执行完整流程（模拟 + 滚动 + 下载）
+        if not fast_mode:
+            await simulate_human_behavior(page, card)
+        try:
+            await card.scroll_into_view_if_needed(timeout=2500)
+        except Exception:
+            pass
+
+        btn_ready = await is_element_ready(btn_loc, timeout=3000)
         if not btn_ready:
             print("    [INFO] 下载按钮被遮挡，将使用 JS 底层强制点击")
 
@@ -472,15 +535,11 @@ async def process_page(page, save_dir, conn, page_num, institution_name):
             "scrape_time": datetime.now().isoformat(),
         })
 
-        # 基础间隔 + 随机增量 + 基于论文位置的额外随机
-        base_interval = SLEEP_BETWEEN[0]
-        position_factor = (SLEEP_BETWEEN[1] - SLEEP_BETWEEN[0]) * ((i % 7) / 7)
-        random_factor = random.uniform(0.5, 2.0)
-        sleep_sec = base_interval + position_factor * random_factor
-
-        # 确保不超过最大值
-        sleep_sec = min(sleep_sec, SLEEP_BETWEEN[1] + 2)
-
+        # 自适应间隔：快速阶段短，正常阶段长
+        if fast_mode:
+            sleep_sec = random.uniform(*FAST_SLEEP)
+        else:
+            sleep_sec = random.uniform(*SLEEP_BETWEEN)
         print(f"    [INFO] 等待 {sleep_sec:.1f}s 后继续...")
         await asyncio.sleep(sleep_sec)
 
@@ -488,19 +547,31 @@ async def process_page(page, save_dir, conn, page_num, institution_name):
 
 
 async def go_next_page(page):
-    """尝试点击下一页，返回是否成功翻页"""
-    next_btn = page.locator(NEXT_PAGE_SELECTOR).first
+    """一次原子 JS 查找+点击下一页，避免 locator 失效"""
     try:
-        if await next_btn.count() == 0:
+        clicked = await page.evaluate("""
+            () => {
+                const btns = document.querySelectorAll('a.next, a');
+                for (const btn of btns) {
+                    if (!btn.textContent.includes('下一页')) continue;
+                    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true'
+                        || (btn.className && btn.className.includes('disabled'))) return false;
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }
+        """)
+        if not clicked:
             return False
-        is_disabled   = await next_btn.get_attribute("disabled")
-        aria_disabled = await next_btn.get_attribute("aria-disabled")
-        class_attr    = await next_btn.get_attribute("class") or ""
-        if is_disabled is not None or aria_disabled == "true" or "disabled" in class_attr:
-            return False
-        await next_btn.scroll_into_view_if_needed()
-        await next_btn.evaluate("node => node.click()")
         await wait_for_page_stable(page, context="翻页后")
+        # 等卡片渲染完才算翻页成功
+        try:
+            await page.wait_for_selector(CARD_SELECTOR, timeout=ELEM_WAIT_TIMEOUT_MS)
+        except Exception:
+            print("[WARN] 翻页后未等到卡片")
+            return False
         return True
     except Exception as e:
         print(f"[WARN] 翻页失败: {type(e).__name__}: {e}")
@@ -510,26 +581,44 @@ async def go_next_page(page):
 # ── 主函数 ─────────────────────────────────
 
 async def main():
+    # 0. 写入 PID 文件（供 ai_supervisor 检测进程状态）
+    _pid_dir = Path("./data")
+    _pid_dir.mkdir(parents=True, exist_ok=True)
+    _pid_file = _pid_dir / f"{Path(__file__).stem}.pid"
+    _pid_file.write_text(str(os.getpid()))
+
     # 1. 获取目标机构
     institution_name = get_target_institution()
 
-    # 2. 获取用户输入的起始页码
-    print("\n" + "="*50)
-    print("请设置起始页码")
-    print("="*50)
-    while True:
-        page_input = input("请输入当前浏览器所在的页码（直接回车默认为1）: ").strip()
-        if not page_input:
-            page_num = 1
+    # 2. 解析 --page 参数
+    _page_arg = 0
+    for idx, arg in enumerate(sys.argv):
+        if arg in ("--page", "-p") and idx + 1 < len(sys.argv):
+            try:
+                _page_arg = int(sys.argv[idx + 1])
+            except ValueError:
+                pass
             break
-        try:
-            page_num = int(page_input)
-            if page_num >= 1:
+
+    if _page_arg >= 1:
+        page_num = _page_arg
+    else:
+        print("\n" + "="*50)
+        print("请设置起始页码")
+        print("="*50)
+        while True:
+            page_input = input("请输入当前浏览器所在的页码（直接回车默认为1）: ").strip()
+            if not page_input:
+                page_num = 1
                 break
-            else:
-                print("页码必须大于等于 1")
-        except ValueError:
-            print("请输入有效的数字")
+            try:
+                page_num = int(page_input)
+                if page_num >= 1:
+                    break
+                else:
+                    print("页码必须大于等于 1")
+            except ValueError:
+                print("请输入有效的数字")
 
     # 3. 创建机构专属保存目录
     save_dir = BASE_SAVE_DIR / institution_name
@@ -545,6 +634,20 @@ async def main():
     print(f"[INFO] PDF 保存目录: {save_dir.resolve()}")
     print(f"[INFO] 数据库: {DB_PATH.resolve()}")
     print(f"[INFO] 连接 CDP: {CDP_URL}")
+
+    # 6. 显示该机构已有记录统计
+    try:
+        rows = conn.execute(
+            "SELECT download_status, COUNT(*) as cnt FROM papers WHERE institution = ? GROUP BY download_status",
+            (institution_name,)
+        ).fetchall()
+        if rows:
+            status_map = {"ok": "已下载", "skip": "无按钮跳过", "timeout": "超时待重试", "error": "出错待重试", "pending": "待处理"}
+            print(f"[INFO] 该机构已有记录：")
+            for r in rows:
+                print(f"       {status_map.get(r['download_status'], r['download_status'])}: {r['cnt']} 篇")
+    except Exception:
+        pass
 
     async with async_playwright() as p:
         try:
@@ -590,7 +693,8 @@ async def main():
 
         try:
             while True:
-                stats = await process_page(page, save_dir, conn, current_page_num, institution_name)
+                fast_mode = current_page_num - page_num + 1 <= FAST_PHASE_PAGES
+                stats = await process_page(page, save_dir, conn, current_page_num, institution_name, fast_mode=fast_mode)
                 for k in total_stats:
                     total_stats[k] += stats[k]
                 print(
@@ -604,8 +708,11 @@ async def main():
                     break
                 current_page_num += 1
                 print(f"[INFO] 正在翻到第 {current_page_num} 页...")
-                # 翻页后的随机等待时间，模拟人类浏览习惯
-                page_wait_time = random.uniform(4, 8)
+                # 翻页后的随机等待时间，快速阶段更短
+                if fast_mode:
+                    page_wait_time = random.uniform(2.5, 4)
+                else:
+                    page_wait_time = random.uniform(3.5, 6)
                 print(f"[INFO] 翻页后等待 {page_wait_time:.1f}s...")
                 await asyncio.sleep(page_wait_time)
 

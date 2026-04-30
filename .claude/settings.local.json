@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python \"机构统计.py\")",
+      "WebSearch",
+      "Bash(sqlite3 \"C:/temp_wangyiran/Mo_papers_Spider/data/membrane_papers.db\" \".schema papers\")",
+      "Bash(python:*)",
+      "Bash(curl -s https://api.github.com/repos/SlyfingNeed/Agentic-Web-Scraper)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f''''Stars: {d.get\\(\"\"stargazers_count\"\"\\)}\\\\nForks: {d.get\\(\"\"forks_count\"\"\\)}\\\\nOpen Issues: {d.get\\(\"\"open_issues_count\"\"\\)}\\\\nCreated: {d.get\\(\"\"created_at\"\"\\)}\\\\nUpdated: {d.get\\(\"\"updated_at\"\"\\)}\\\\nPushed: {d.get\\(\"\"pushed_at\"\"\\)}\\\\nSize: {d.get\\(\"\"size\"\"\\)}\\\\nLanguage: {d.get\\(\"\"language\"\"\\)}\\\\nLicense: {d.get\\(\"\"license\"\",{}\\).get\\(\"\"spdx_id\"\"\\) if d.get\\(\"\"license\"\"\\) else \"\"None\"\"}\\\\nDefault Branch: {d.get\\(\"\"default_branch\"\"\\)}\\\\nTopics: {d.get\\(\"\"topics\"\"\\)}''''\\)\")",
+      "Bash(ls -la data/*.pid data/logs/)",
+      "Bash(python -c \":*)",
+      "Bash(ls \"C:/temp_wangyiran/Mo_papers_Spider/data/\"*.pid)"
+    ]
+  }
+}
